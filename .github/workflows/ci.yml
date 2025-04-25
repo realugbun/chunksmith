@@ -1,0 +1,41 @@
+name: Python CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install uv
+      run: pip install uv
+
+    - name: Install dependencies
+      run: uv sync --dev
+
+    - name: Lint with Ruff
+      run: |
+        echo "Linting using Ruff"
+        uv add --dev ruff
+        uv run ruff check .
+        uv run ruff format --check .
+
+    - name: Test with pytest (placeholder)
+      run: |
+        echo "Testing step placeholder. Add 'uv add --dev pytest' and 'uv run pytest' here."
+        # uv add --dev pytest
+        # uv run pytest 

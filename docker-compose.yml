@@ -1,0 +1,62 @@
+services:
+  chunksmith-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    env_file:
+      - .env
+    volumes:
+      - data_volume:/data
+    ports:
+      - "8000:80"
+    depends_on:
+      chunksmith-redis:
+        condition: service_healthy
+      chunksmith-postgres:
+        condition: service_healthy
+
+  chunksmith-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    env_file:
+      - .env
+    volumes:
+      - data_volume:/data
+    depends_on:
+      chunksmith-redis:
+        condition: service_healthy
+      chunksmith-postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+
+  chunksmith-redis:
+    image: redis:6-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  chunksmith-postgres:
+    image: postgres:15-alpine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    env_file:
+      - .env
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-chunksmith} -d $${POSTGRES_DB:-chunksmith}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  data_volume: 
