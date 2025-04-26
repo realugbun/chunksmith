@@ -196,8 +196,24 @@ async def test_ingestion_invalid_callback_secret_length(
     assert response_text.status_code == 422, (
         f"Expected 422 for short secret (text), got {response_text.status_code}: {response_text.text}"
     )
-    assert response_text.json()["detail"] == expected_error_detail, (
-        f"Unexpected error detail (text): {response_text.json().get('detail')}"
+    # Updated assertion for Pydantic error structure
+    error_details = response_text.json().get("detail", [])
+    assert isinstance(error_details, list) and len(error_details) > 0, (
+        f"Expected error details list, got: {error_details}"
+    )
+    secret_error = next(
+        (
+            item
+            for item in error_details
+            if item.get("loc") == ["body", "callback_secret"]
+        ),
+        None,
+    )
+    assert secret_error is not None, (
+        f"Did not find error detail specifically for callback_secret: {error_details}"
+    )
+    assert expected_error_detail in secret_error.get("msg", ""), (
+        f"Unexpected error message in detail (text): {secret_error.get('msg')}"
     )
     print("/ingest/text rejected short secret as expected.")
 
@@ -347,13 +363,13 @@ async def test_text_ingestion_with_webhook_e2e(
     print("Webhook received exactly once.")
 
     webhook_call = received_webhook_calls[0]
-    received_headers = webhook_call["headers"]
-    received_body_bytes = webhook_call["body"]
+    webhook_headers = webhook_call["headers"]
+    webhook_body = webhook_call["body"]
 
     # --- 5a. Verify Signature ---
     print("Verifying webhook signature...")
-    signature_header = received_headers.get("x-chunksmith-signature")
-    timestamp_header = received_headers.get("x-chunksmith-timestamp")
+    signature_header = webhook_headers.get("x-chunksmith-signature")
+    timestamp_header = webhook_headers.get("x-chunksmith-timestamp")
     assert signature_header, "Webhook missing X-ChunkSmith-Signature header"
     assert timestamp_header, "Webhook missing X-ChunkSmith-Timestamp header"
     assert signature_header.startswith("sha256="), (
@@ -379,7 +395,7 @@ async def test_text_ingestion_with_webhook_e2e(
 
     # --- 5a.2 Verify Signature Content ---
     # Construct the message that *should* have been signed
-    message_to_verify = f"{timestamp_header}.".encode("utf-8") + received_body_bytes
+    message_to_verify = f"{timestamp_header}.".encode("utf-8") + webhook_body
 
     expected_signature = hmac.new(
         callback_secret.encode("utf-8"),
@@ -395,10 +411,10 @@ async def test_text_ingestion_with_webhook_e2e(
     # --- 5b. Verify Payload ---
     print("Verifying webhook payload...")
     try:
-        received_payload = json.loads(received_body_bytes.decode("utf-8"))
+        received_payload = json.loads(webhook_body.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         pytest.fail(
-            f"Failed to decode webhook payload JSON: {e}\nBody: {received_body_bytes!r}"
+            f"Failed to decode webhook payload JSON: {e}\nBody: {webhook_body!r}"
         )
 
     # Check key fields against the final job data we polled
@@ -569,13 +585,13 @@ async def test_file_ingestion_e2e(
     print("Webhook received exactly once for file ingest.")
 
     webhook_call = received_webhook_calls[0]
-    received_headers = webhook_call["headers"]
-    received_body_bytes = webhook_call["body"]
+    webhook_headers = webhook_call["headers"]
+    webhook_body = webhook_call["body"]
 
     # --- 6a. Verify Signature --- #
     print("Verifying file ingest webhook signature...")
-    signature_header = received_headers.get("x-chunksmith-signature")
-    timestamp_header = received_headers.get("x-chunksmith-timestamp")
+    signature_header = webhook_headers.get("x-chunksmith-signature")
+    timestamp_header = webhook_headers.get("x-chunksmith-timestamp")
     assert signature_header, "File webhook missing X-ChunkSmith-Signature header"
     assert timestamp_header, "File webhook missing X-ChunkSmith-Timestamp header"
     received_signature = signature_header.split("=")[1]
@@ -595,7 +611,7 @@ async def test_file_ingestion_e2e(
         )
 
     # Verify signature content
-    message_to_verify = f"{timestamp_header}.".encode("utf-8") + received_body_bytes
+    message_to_verify = f"{timestamp_header}.".encode("utf-8") + webhook_body
     expected_signature = hmac.new(
         callback_secret.encode("utf-8"), message_to_verify, hashlib.sha256
     ).hexdigest()
@@ -607,10 +623,10 @@ async def test_file_ingestion_e2e(
     # --- 6b. Verify Payload --- #
     print("Verifying file ingest webhook payload...")
     try:
-        received_payload = json.loads(received_body_bytes.decode("utf-8"))
+        received_payload = json.loads(webhook_body.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         pytest.fail(
-            f"Failed to decode file webhook payload JSON: {e}\nBody: {received_body_bytes!r}"
+            f"Failed to decode file webhook payload JSON: {e}\nBody: {webhook_body!r}"
         )
 
     assert received_payload.get("job_id") == job_id, (
@@ -816,3 +832,286 @@ async def test_pdf_ingestion_e2e(http_client: httpx.AsyncClient, tmp_path: Path)
     print("Document still exists verified.")
 
     print(f"--- Finished: {test_pdf_ingestion_e2e.__name__} --- PASS")
+
+
+# === URL INGESTION TESTS ===
+
+# Define a sample URL for testing - ensure it's stable and accessible
+# Using a raw GitHub Gist URL as an example
+SAMPLE_TEST_URL = "https://example.com/"
+SAMPLE_TEST_URL_CONTENT_SNIPPET = "Example Domain"
+
+
+@pytest.mark.asyncio
+async def test_url_ingestion_with_webhook_e2e(
+    http_client: httpx.AsyncClient, webhook_receiver: Tuple[str, Queue]
+):
+    """
+    Tests the end-to-end flow for ingesting from a URL with webhook notification:
+    1. Submit URL with callback URL and secret.
+    2. Poll job status until completion.
+    3. Verify document text/metadata (source_url, fetched_at).
+    4. Verify chunks (metadata).
+    5. Verify webhook received, signature is valid, and payload is correct.
+    6. Delete job and verify deletion (cascades to document).
+    7. Verify document deletion.
+    """
+    receiver_url, received_requests_queue = webhook_receiver
+    callback_secret = secrets.token_hex(32)  # Generate a random secret
+    test_url = SAMPLE_TEST_URL
+    job_id = None
+    doc_id = None
+
+    print(f"\n--- Starting: {test_url_ingestion_with_webhook_e2e.__name__} ---")
+    print(f"Using Test URL: {test_url}")
+    print(f"Webhook Receiver URL: {receiver_url}")
+
+    # 1. Submit URL Ingestion Request
+    print("Submitting URL ingestion request...")
+    payload = {
+        "url": test_url,
+        "callback_url": receiver_url,
+        "callback_secret": callback_secret,
+    }
+    headers_override = http_client.headers.copy()
+    headers_override["Content-Type"] = "application/json"
+    response = await http_client.post(
+        "/v1/ingest/url", json=payload, headers=headers_override
+    )
+    assert response.status_code == 202, (
+        f"Expected 202 Accepted status code, got {response.status_code}: {response.text}"
+    )
+    response_data = response.json()
+    job_id = response_data.get("job_id")
+    assert job_id, "Job ID not found in response"
+    print(f"Job submitted successfully. Job ID: {job_id}")
+
+    try:
+        # 2. Poll for Job Completion
+        print("Polling for job completion...")
+        final_job_data = await poll_for_job_completion(
+            http_client, job_id, JOB_COMPLETION_TIMEOUT
+        )
+        assert final_job_data["status"] == "completed", (
+            f"Job failed or completed with errors: {final_job_data.get('status')} - {final_job_data.get('error_message')}"
+        )
+        doc_id = final_job_data.get("doc_id")
+        assert doc_id, "Document ID not found in completed job data"
+        print(f"Job {job_id} completed successfully. Doc ID: {doc_id}")
+
+        # 3. Verify Document Content and Metadata
+        print("Verifying document...")
+        # Use /v1/documents/{doc_id}/fulltext endpoint
+        doc_text_response = await http_client.get(f"/v1/documents/{doc_id}/fulltext")
+        assert doc_text_response.status_code == 200
+        doc_text_data = doc_text_response.json()
+        assert SAMPLE_TEST_URL_CONTENT_SNIPPET in doc_text_data.get(
+            "text",
+            "",  # Use .get with default
+        ), "Document text does not contain expected content snippet."
+        print(
+            f"Document text verified (contains snippet: '{SAMPLE_TEST_URL_CONTENT_SNIPPET}')."
+        )
+
+        # Retrieve full document metadata to check URL-specific fields
+        # Assuming /v1/documents/{doc_id} endpoint exists and returns full metadata
+        doc_meta_response = await http_client.get(
+            f"/v1/jobs/{job_id}"
+        )  # Check job data for doc metadata implicitly stored
+        assert doc_meta_response.status_code == 200
+        # Instead of a separate /documents/{doc_id} endpoint (which isn't shown in the file)
+        # let's check the database record indirectly via chunks or assume job reflects it
+        # We will verify source_url and fetched_at via the chunk metadata below
+
+        # 4. Verify Chunks (Basic Check)
+        print("Verifying chunks...")
+        chunks_response = await http_client.get(f"/v1/documents/{doc_id}/chunks")
+        assert chunks_response.status_code == 200
+        chunks_data = chunks_response.json()
+        chunks = chunks_data.get("chunks", [])
+        assert len(chunks) > 0, "No chunks found for the document"
+        print(f"Found {len(chunks)} chunks.")
+        # Verify metadata in the first chunk
+        first_chunk = chunks[0]
+        chunk_metadata = first_chunk.get("metadata", {})
+        assert chunk_metadata.get("source") == test_url, (
+            "Chunk metadata missing correct source (URL)"
+        )
+        assert chunk_metadata.get("source_url") == test_url, (
+            "Chunk metadata missing correct source_url"
+        )
+        assert chunk_metadata.get("fetched_at") is not None, (
+            "Chunk metadata missing fetched_at"
+        )
+        # Optionally parse and check fetched_at format/recency
+        try:
+            fetched_time = datetime.fromisoformat(
+                chunk_metadata["fetched_at"].replace("Z", "+00:00")
+            )
+            assert datetime.now(timezone.utc) - fetched_time < timedelta(minutes=5), (
+                "fetched_at timestamp seems too old"
+            )
+            print("First chunk metadata verified (source, source_url, fetched_at).")
+        except (ValueError, TypeError, KeyError):
+            pytest.fail(
+                f"fetched_at timestamp '{chunk_metadata.get('fetched_at')}' is not a valid ISO format string or missing"
+            )
+
+        # 5. Verify Webhook Received and Signature
+        print("Verifying webhook reception...")
+        try:
+            webhook_data = received_requests_queue.get(
+                timeout=10
+            )  # Increased timeout slightly
+            print("Webhook data received from queue.")
+        except Empty:
+            pytest.fail("Webhook receiver did not receive a request within timeout.")
+
+        webhook_headers = webhook_data["headers"]
+        webhook_body = webhook_data["body"]
+        # Signature check depends on the header name used in hooks.py (assuming x-chunksmith-signature)
+        signature_header = webhook_headers.get("x-chunksmith-signature")
+        timestamp_header = webhook_headers.get("x-chunksmith-timestamp")
+        assert signature_header, (
+            "Webhook request missing signature header (X-ChunkSmith-Signature)"
+        )
+        assert timestamp_header, (
+            "Webhook request missing timestamp header (X-ChunkSmith-Timestamp)"
+        )
+
+        # Verify Timestamp
+        try:
+            received_time = datetime.fromisoformat(timestamp_header)
+            assert received_time.tzinfo is not None, "Timestamp missing timezone info"
+            time_diff = datetime.now(timezone.utc) - received_time
+            assert abs(time_diff) < timedelta(minutes=5), (
+                f"Timestamp is not recent: {timestamp_header}"
+            )
+            print(f"Webhook timestamp verified and is recent: {timestamp_header}")
+        except (ValueError, AssertionError) as e:
+            pytest.fail(
+                f"Timestamp header validation failed: {e}. Header: {timestamp_header}"
+            )
+
+        # Verify Signature Content
+        # Signature content is defined in workers/hooks.py run_dispatch_webhook_sync
+        # It should be timestamp + "." + body
+        message_to_verify = (
+            f"{timestamp_header}.".encode("utf-8") + webhook_body
+        )  # webhook_body is already bytes
+        expected_signature = hmac.new(
+            callback_secret.encode("utf-8"),
+            message_to_verify,
+            hashlib.sha256,
+        ).hexdigest()
+
+        # Extract signature value after "sha256=" prefix if present
+        received_signature_value = signature_header
+        if signature_header.startswith("sha256="):
+            received_signature_value = signature_header[len("sha256=") :]
+
+        assert hmac.compare_digest(received_signature_value, expected_signature), (
+            f"Webhook signature mismatch. Expected: {expected_signature}, Received: {received_signature_value}"
+        )
+        print("Webhook signature verified successfully.")
+
+        # Verify Payload (matches job status)
+        webhook_payload = json.loads(webhook_body.decode("utf-8"))
+        assert webhook_payload["job_id"] == job_id
+        assert webhook_payload["status"] == "completed"
+        assert webhook_payload["doc_id"] == doc_id
+        print("Webhook payload verified (job_id, status, doc_id).")
+
+    finally:
+        # 6. Delete Job and Document (Cleanup)
+        if job_id:
+            print(f"Cleaning up job {job_id}...")
+            # Assuming DELETE /v1/jobs/{job_id} exists and performs soft delete
+            delete_response = await http_client.delete(f"/v1/jobs/{job_id}")
+            # Check for successful deletion status codes
+            assert delete_response.status_code in [200, 204], (
+                f"Failed to delete job: {delete_response.status_code} - {delete_response.text}"
+            )
+            print("Job deleted successfully.")
+
+            # 7. Verify Document *Still Exists* after soft job delete
+            # (Assuming soft delete on job doesn't cascade delete document)
+            print(f"Verifying document {doc_id} still exists after job soft delete...")
+            await asyncio.sleep(1)  # Give DB time for potential changes
+            # Use /v1/documents/{doc_id}/fulltext to check document existence
+            doc_check_response = await http_client.get(
+                f"/v1/documents/{doc_id}/fulltext"
+            )
+            assert doc_check_response.status_code == 200, (
+                f"Document {doc_id} should still exist after job soft delete, but got {doc_check_response.status_code}"
+            )
+            print(f"Document {doc_id} confirmed still exists.")
+            # Optionally, also test deleting the document directly via API if endpoint exists
+
+    print(f"--- Finished: {test_url_ingestion_with_webhook_e2e.__name__} --- PASS")
+
+
+@pytest.mark.asyncio
+async def test_url_ingestion_invalid_input(http_client: httpx.AsyncClient):
+    """
+    Tests /ingest/url endpoint with invalid input scenarios:
+    - Invalid URL format
+    - Callback URL without secret
+    """
+    print(f"\n--- Starting: {test_url_ingestion_invalid_input.__name__} ---")
+
+    headers_override = http_client.headers.copy()
+    headers_override["Content-Type"] = "application/json"
+
+    # 1. Invalid URL Format
+    print("Testing with invalid URL format...")
+    payload_invalid_url = {
+        "url": "htp://invalid-url-format",  # Intentionally wrong scheme
+        "callback_url": None,
+        "callback_secret": None,
+    }
+    response_invalid_url = await http_client.post(
+        "/v1/ingest/url", json=payload_invalid_url, headers=headers_override
+    )
+    assert response_invalid_url.status_code == 422, (
+        f"Expected 422 for invalid URL, got {response_invalid_url.status_code}: {response_invalid_url.text}"
+    )
+    # Pydantic error message might vary slightly, check for key details
+    error_detail = response_invalid_url.json().get("detail", [{}])[0]
+    assert error_detail.get("loc") == ["body", "url"], (
+        f"Error location should be 'url': {error_detail.get('loc')}"
+    )
+    # Check message for URL scheme error indication
+    assert "URL scheme should be 'http' or 'https'" in error_detail.get("msg", ""), (
+        f"Error message mismatch for invalid scheme: {error_detail.get('msg')}"
+    )
+    print("Invalid URL format rejected as expected.")
+
+    # 2. Callback URL without Secret
+    print("Testing with callback URL but no secret...")
+    payload_missing_secret = {
+        "url": SAMPLE_TEST_URL,  # Use a valid URL here
+        "callback_url": "http://example.com/callback",  # Need a syntactically valid URL
+        "callback_secret": None,  # Explicitly None
+    }
+    response_missing_secret = await http_client.post(
+        "/v1/ingest/url", json=payload_missing_secret, headers=headers_override
+    )
+    assert response_missing_secret.status_code == 422, (
+        f"Expected 422 for missing secret, got {response_missing_secret.status_code}: {response_missing_secret.text}"
+    )
+    # Check error detail points to the model validation (loc: ["body"] for @model_validator)
+    error_details = response_missing_secret.json().get("detail", [{}])
+    # Find the specific error related to the model validation
+    model_error = next(
+        (item for item in error_details if item.get("loc") == ["body"]), None
+    )
+    assert model_error is not None, (
+        f"Did not find model-level error detail (loc: ['body']): {error_details}"
+    )
+    assert "required when callback_url is provided" in model_error.get("msg", ""), (
+        f"Error message mismatch for missing secret: {model_error.get('msg')}"
+    )
+    print("Callback URL without secret rejected as expected.")
+
+    print(f"--- Finished: {test_url_ingestion_invalid_input.__name__} --- PASS")

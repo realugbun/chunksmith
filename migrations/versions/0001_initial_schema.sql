@@ -31,8 +31,10 @@ CREATE TABLE IF NOT EXISTS documents (
     filename TEXT,
     content_type TEXT,
     file_path TEXT,
-    full_text TEXT, -- Consider implications for large text (as noted in checklist)
+    full_text TEXT,
     page_count INT,
+    source_url TEXT,
+    fetched_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at TIMESTAMPTZ
 );

@@ -1,9 +1,10 @@
-import asyncio  # Import asyncio at the top
+import asyncio
 import uuid
 import logging
 import sys
 import time
-from typing import Optional, Union
+import functools
+from typing import Optional, Callable, Any
 from datetime import datetime, timezone
 
 from redis import Redis
@@ -20,6 +21,7 @@ from core.metrics import (
     DOCS_PROCESSED_COUNTER,
     CHUNKS_CREATED_COUNTER,
     JOBS_FAILED_COUNTER,
+    JOB_PROCESSING_DURATION_SECONDS,
 )
 
 ## NOTE: The service init and worker tasks need to be in the same file to prevent
@@ -38,206 +40,248 @@ def setup_task_logging(correlation_id: Optional[str]):
     correlation_id_cv.set(correlation_id)
 
 
-async def _process_document_common(
-    job_id: uuid.UUID,
-    correlation_id: Optional[str],
-    source_description: str,
-    content_source: Union[str, bytes],
-    filename: Optional[str] = None,
-    content_type: Optional[str] = None,
-) -> None:
-    """Common logic for processing a document using IngestionService."""
-    setup_task_logging(correlation_id)
-    logger.info(
-        "Starting processing for job",
-        extra={
-            "job_id": job_id,
-            "source_description": source_description,
-            "content_type": content_type,
-        },
-    )
+# --- Worker Decorator --- #
 
-    # Log entry into the common function
-    common_func_entry_time = time.time()
-    logger.debug("Entered _process_document_common for job", extra={"job_id": job_id})
 
-    start_time = time.time()
-    doc_id = None
-    final_status = "failed"
-    error_message = None
-    total_chunks = 0
-    ingestion_result: Optional[IngestionResult] = None
+def job_processor(func: Callable[..., Any]) -> Callable[..., None]:
+    """Decorator for RQ worker functions to handle common logic:
+    - Logging setup/teardown
+    - Timing
+    - Exception handling
+    - Job status updates (processing, completed, failed)
+    - Metrics recording
+    """
 
-    try:
-        # 1. Update Job Status to Processing
-        await update_job_status(
-            job_id=job_id, status="processing", started_at=datetime.now(timezone.utc)
-        )
-        logger.debug(
-            "Finished awaiting update_job_status (processing)",
-            extra={
-                "job_id": job_id,
-                "time_since_entry": time.time() - common_func_entry_time,
-            },
-        )
+    @functools.wraps(func)
+    async def wrapper(
+        job_uuid: uuid.UUID, correlation_id: Optional[str], *args, **kwargs
+    ) -> None:
+        setup_task_logging(correlation_id)
+        job_id_str = str(job_uuid)
+        start_time = time.time()
+        final_status: str = "failed"
+        error_message: Optional[str] = None
+        doc_id: Optional[uuid.UUID] = None
+        ingestion_result: Optional[IngestionResult] = None
+        total_chunks: int = 0
+        failure_reason = "unknown"
 
-        # 2. Perform Ingestion using the centralized service
-        logger.info("Running ingestion service", extra={"job_id": job_id})
-        ingestion_result = await ingestion_service.process(
-            content_source=content_source, content_type=content_type, filename=filename
-        )
+        # Determine source representation for logging
+        source_repr = "unknown_source"
+        if args:
+            # Heuristic: first arg after correlation_id might be the main input
+            # For URL: args[0] is the URL string
+            # For Text: args[0] is the text string
+            # For File: args[0] is bytes, args[1] is filename
+            if func.__name__ == "process_document_url":
+                source_repr = f"url: {args[0]}"
+            elif func.__name__ == "process_document_text":
+                filename = args[1] if len(args) > 1 else None
+                source_repr = f"text_payload ({filename or 'no filename'})"
+            elif func.__name__ == "process_document_file":
+                filename = args[1] if len(args) > 1 else "unknown_file"
+                source_repr = f"file: {filename}"
+            # Add more specific checks if needed based on function signature
 
-        full_text = ingestion_result.full_text
-        chunks = ingestion_result.chunks
-        page_count = ingestion_result.page_count
-        total_chunks = len(chunks)
-        logger.info(
-            "Ingestion service finished",
-            extra={"job_id": job_id, "chunks": total_chunks, "pages": page_count},
-        )
+        log_extra = {
+            "job_id": job_id_str,
+            "correlation_id": correlation_id,
+            "source": source_repr,
+            "worker_function": func.__name__,
+        }
 
-        # Check if ingestion produced text
-        if not full_text and not chunks:
-            logger.warning(
-                "Ingestion service returned no text or chunks", extra={"job_id": job_id}
-            )
-            # Decide if this is completed_with_errors or failed
-            final_status = "failed"
-            error_message = "Document processing yielded no text content."
-            # Skip DB saving if no content
-            raise ValueError(error_message)  # Go directly to finally block
-
-        # 4. Save Results to DB
-        logger.info("Saving results", extra={"job_id": job_id})
-        doc_id = await create_document(
-            job_id=job_id,
-            filename=filename,
-            content_type=content_type,
-            file_path=None,
-            full_text=full_text,
-            page_count=page_count,
-        )
-        logger.info(
-            "Created document record", extra={"job_id": job_id, "doc_id": doc_id}
-        )
-
-        if chunks:
-            # Add doc_id to each chunk before batch insert
-            for chunk in chunks:
-                chunk["doc_id"] = doc_id
-            await create_chunks_batch(chunks)
-            logger.info(
-                "Saved chunks",
-                extra={
-                    "job_id": job_id,
-                    "total_chunks": total_chunks,
-                    "doc_id": doc_id,
-                },
-            )
-        else:
-            logger.error(
-                "No chunks were generated", extra={"job_id": job_id, "doc_id": doc_id}
-            )
-
-        # 5. Determine Final Status
-        # Skipped pages logic removed as Docling handles internal errors
-        final_status = "completed"
-        logger.info("Job completed successfully", extra={"job_id": job_id})
-
-    except Exception as e:
-        logger.exception("Processing failed", exc_info=e, extra={"job_id": job_id})
-        error_message = (
-            f"Processing failed: {str(e)[:500]}"  # Limit error message length
-        )
-        final_status = "failed"
-
-    finally:
-        # 6. Update Job Status with final result
-        end_time = time.time()
-        processing_duration = end_time - start_time
-
-        logger.info(
-            "Updating final status",
-            extra={"job_id": job_id, "final_status": final_status},
-        )
+        logger.info(f"Starting job processing ({func.__name__}).", extra=log_extra)
 
         try:
-            # Update DB first
+            # 1. Update Status to Processing
             await update_job_status(
-                job_id=job_id,
-                status=final_status,
-                completed_at=datetime.now(timezone.utc),
-                processing_seconds=processing_duration,
-                duration_seconds=processing_duration,
-                error_message=error_message,
-                doc_id=doc_id,
+                job_id=job_uuid,
+                status="processing",
+                started_at=datetime.now(timezone.utc),
             )
+            logger.debug("Set job status to processing", extra=log_extra)
 
-            # Increment counters only after successful DB update
-            if final_status == "completed":
-                DOCS_PROCESSED_COUNTER.inc()
-                CHUNKS_CREATED_COUNTER.inc(total_chunks)
-            elif final_status == "failed":
-                JOBS_FAILED_COUNTER.inc()
+            # 2. Execute the wrapped worker function's core logic
+            ingestion_result = await func(job_uuid, correlation_id, *args, **kwargs)
+            # Ensure the wrapped function returns IngestionResult or raises Exception
+            if not isinstance(ingestion_result, IngestionResult):
+                logger.error(
+                    f"Worker function {func.__name__} did not return IngestionResult",
+                    extra=log_extra,
+                )
+                raise TypeError(
+                    f"Worker function {func.__name__} must return IngestionResult"
+                )
 
-            logger.debug(
-                "Job final status updated and metrics recorded",
-                extra={"job_id": job_id},
-            )
+            # 3. Process successful result
+            logger.info("Worker function completed successfully.", extra=log_extra)
+            full_text = ingestion_result.full_text
+            chunks = ingestion_result.chunks
+            page_count = ingestion_result.page_count
+            total_chunks = len(chunks)
+            source_filename = (
+                ingestion_result.source_filename
+            )  # Get filename from result
+            content_type = (
+                ingestion_result.detected_content_type
+            )  # Get content type from result
+            source_url = ingestion_result.source_url
+            fetched_at = ingestion_result.fetched_at
 
-        except Exception as update_err:
+            log_extra["detected_content_type"] = content_type
+            log_extra["page_count"] = page_count
+            log_extra["chunk_count"] = total_chunks
+
+            if not full_text and not chunks:
+                logger.warning(
+                    "Ingestion service returned no text or chunks", extra=log_extra
+                )
+                final_status = "failed"
+                error_message = "Document processing yielded no text content."
+            else:
+                # 4. Save Results to DB (only if content was produced)
+                logger.info("Saving results to database...", extra=log_extra)
+                doc_id = await create_document(
+                    job_id=job_uuid,
+                    filename=source_filename,
+                    content_type=content_type,
+                    file_path=None,
+                    full_text=full_text,
+                    page_count=page_count,
+                    source_url=source_url,
+                    fetched_at=fetched_at,
+                )
+                log_extra["doc_id"] = str(doc_id)
+                logger.info("Created document record", extra=log_extra)
+
+                if chunks:
+                    # Add doc_id to each chunk before batch insert
+                    for chunk in chunks:
+                        chunk["doc_id"] = doc_id
+                    await create_chunks_batch(chunks)
+                    logger.info("Saved chunks to database", extra=log_extra)
+                else:
+                    # This case might be unlikely if full_text exists, but good to log
+                    logger.warning(
+                        "No chunks were generated, although full text might exist.",
+                        extra=log_extra,
+                    )
+
+                final_status = "completed"
+                logger.info("Job completed successfully.", extra=log_extra)
+
+        except Exception as e:
             logger.exception(
-                "Failed to update final status or metrics",
-                exc_info=update_err,
-                extra={"job_id": job_id},
+                f"Processing failed in {func.__name__}", exc_info=e, extra=log_extra
             )
+            error_message = f"{type(e).__name__}: {str(e)[:500]}"
+            failure_reason = type(e).__name__
+            final_status = "failed"
 
-        correlation_id_cv.set(None)  # Clear context var at the end of the task
+        finally:
+            # 5. Update Final Job Status & Metrics
+            end_time = time.time()
+            processing_duration = end_time - start_time
+            log_extra["final_status"] = final_status
+            log_extra["processing_seconds"] = round(processing_duration, 3)
+            if error_message:
+                log_extra["error_message"] = error_message
+
+            logger.info(
+                "Updating final job status and recording metrics.", extra=log_extra
+            )
+            try:
+                await update_job_status(
+                    job_id=job_uuid,
+                    status=final_status,
+                    completed_at=datetime.now(timezone.utc),
+                    processing_seconds=processing_duration,
+                    duration_seconds=processing_duration,
+                    error_message=error_message,
+                    doc_id=doc_id,
+                )
+
+                # Record metrics after successful status update
+                JOB_PROCESSING_DURATION_SECONDS.labels(
+                    worker=func.__name__, status=final_status
+                ).observe(processing_duration)
+                if final_status == "completed":
+                    DOCS_PROCESSED_COUNTER.labels(worker=func.__name__).inc()
+                    CHUNKS_CREATED_COUNTER.labels(worker=func.__name__).inc(
+                        total_chunks
+                    )
+                elif final_status == "failed":
+                    # Use the captured failure reason
+                    JOBS_FAILED_COUNTER.labels(
+                        worker=func.__name__, reason=failure_reason
+                    ).inc()
+
+                logger.debug(
+                    "Job final status updated and metrics recorded.", extra=log_extra
+                )
+
+            except Exception as update_err:
+                # Log critical failure if status update/metrics fail
+                log_extra["update_error"] = str(update_err)
+                logger.exception(
+                    "CRITICAL: Failed to update final job status or metrics!",
+                    exc_info=update_err,
+                    extra=log_extra,
+                )
+
+            setup_task_logging(None)
+
+    return wrapper
 
 
-# --- Task Entry Points --- #
+# --- Task Entry Points (Decorated) --- #
 
 
+@job_processor
 async def process_document_file(
-    job_uuid_arg: uuid.UUID,
-    correlation_id_arg: Optional[str],
-    file_content_arg: bytes,
-    filename_arg: Optional[str],
-    content_type_arg: Optional[str],
-):
-    logger.debug(
-        "process_document_file: About to await _process_document_common for job",
-        extra={"job_id": job_uuid_arg},
-    )  # Log before await
-    await _process_document_common(
-        job_id=job_uuid_arg,
-        correlation_id=correlation_id_arg,
-        source_description=f"file content: {filename_arg}",
-        content_source=file_content_arg,
-        filename=filename_arg,
-        content_type=content_type_arg,
+    job_uuid: uuid.UUID,
+    correlation_id: Optional[str],
+    file_content: bytes,
+    filename: Optional[str],
+    content_type: Optional[str],
+) -> IngestionResult:
+    """Processes uploaded file content. Wrapped by job_processor."""
+    # Core logic: call ingestion service
+    # The decorator handles logging start/end, status updates, errors, metrics
+    return await ingestion_service.process(
+        content_source=file_content, filename=filename, content_type=content_type
     )
 
 
+@job_processor
 async def process_document_text(
-    job_uuid_arg: uuid.UUID,
-    correlation_id_arg: Optional[str],
-    text_content_arg: str,
-    filename_arg: Optional[str],
-):
-    """RQ task entry point for processing text payload."""
-
-    logger.debug(
-        "process_document_text: About to await _process_document_common for job",
-        extra={"job_id": job_uuid_arg},
-    )  # Log before await
-    await _process_document_common(
-        job_id=job_uuid_arg,
-        correlation_id=correlation_id_arg,
-        source_description="text payload",
-        content_source=text_content_arg,
-        filename=filename_arg,
+    job_uuid: uuid.UUID,
+    correlation_id: Optional[str],
+    text_content: str,
+    filename: Optional[str],
+) -> IngestionResult:
+    """Processes raw text payload. Wrapped by job_processor."""
+    # Core logic: call ingestion service
+    # The decorator handles logging start/end, status updates, errors, metrics
+    return await ingestion_service.process(
+        content_source=text_content,
+        filename=filename,
         content_type="text/plain",
+    )
+
+
+# New worker function for URL
+@job_processor
+async def process_document_url(
+    job_uuid: uuid.UUID,
+    correlation_id: Optional[str],
+    source_url: str,
+) -> IngestionResult:
+    """Processes content from a URL. Wrapped by job_processor."""
+    # Core logic: call ingestion service with the URL
+    # The decorator handles logging start/end, status updates, errors, metrics
+    return await ingestion_service.process(
+        content_source=source_url, filename=None, content_type=None
     )
 
 
@@ -265,13 +309,14 @@ if __name__ == "__main__":
             name,
             connection=redis_conn,
             default_timeout=settings.REDIS_QUEUE_TIMEOUT_SECONDS,
+            is_async=True,
         )
         for name in QUEUES_TO_LISTEN
     ]
 
     logger.info(
         "Creating standard Worker listening on queues",
-        extra={"queues": QUEUES_TO_LISTEN},
+        extra={"queues": QUEUES_TO_LISTEN, "is_async": True},
     )
 
     worker = Worker(queues, connection=redis_conn, log_job_description=False)

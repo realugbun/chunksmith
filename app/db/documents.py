@@ -16,14 +16,25 @@ async def create_document(
     file_path: Optional[str],
     full_text: Optional[str],
     page_count: Optional[int],
+    source_url: Optional[str] = None,
+    fetched_at: Optional[str] = None,
 ) -> uuid.UUID:
     """Creates a new document record associated with a job and returns its UUID."""
     insert_sql = """
-        INSERT INTO documents (job_id, filename, content_type, file_path, full_text, page_count)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO documents (job_id, filename, content_type, file_path, full_text, page_count, source_url, fetched_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING doc_id;
     """
-    values = (job_id, filename, content_type, file_path, full_text, page_count)
+    values = (
+        job_id,
+        filename,
+        content_type,
+        file_path,
+        full_text,
+        page_count,
+        source_url,
+        fetched_at,
+    )
     pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor() as cur:

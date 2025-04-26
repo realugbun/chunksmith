@@ -1,6 +1,6 @@
 # ChunkSmith
 
-**ChunkSmith** is a robust backend service designed for efficiently ingesting various document types (including PDFs, DOCX, and images with OCR), processing their content, and splitting them into meaningful, context-aware chunks. It's built for asynchronous processing and scalability, making it suitable for integration into larger data pipelines or applications requiring document understanding.
+**ChunkSmith** is a robust backend service designed for efficiently ingesting various document types (including direct URL fetching, PDFs, DOCX, and images with OCR), processing their content, and splitting them into meaningful, context-aware chunks. It's built for asynchronous processing and scalability, making it suitable for integration into larger data pipelines or applications requiring document understanding.
 
 [![Language](https://img.shields.io/badge/Language-Python%203.12-blue)](https://www.python.org/)
 [![Framework](https://img.shields.io/badge/Framework-FastAPI-green)](https://fastapi.tiangolo.com/)
@@ -20,6 +20,7 @@
 - [API Usage](#api-usage)
   - [1a. Ingest Text](#1a-ingest-text)
   - [1b. Ingest File](#1b-ingest-file)
+  - [1c. Ingest URL](#1c-ingest-url)
   - [2. Get Job Status](#2-get-job-status)
   - [3a. Get Document Full Text](#3a-get-document-full-text)
   - [3b. Get Document Chunks](#3b-get-document-chunks)
@@ -32,6 +33,7 @@
 ## Key Features
 
 *   **Multi-Format Ingestion:** Accepts raw text, PDF, DOCX, XLSX, PPTX, Markdown, AsciiDoc, HTML, CSV, and common image formats (PNG, JPEG, TIFF, BMP).
+*   **URL Ingestion:** Ingests documents directly from HTTP/HTTPS URLs.
 *   **Optical Character Recognition (OCR):** Built-in OCR for extracting text from PDFs and images using `docling`.
 *   **Asynchronous Processing:** Leverages a robust job queue (Redis & RQ) for handling time-consuming ingestion and processing tasks without blocking API requests.
 *   **Scalable Workers:** Easily scale the number of processing workers to handle varying loads (see [Scaling Workers](#scaling-workers)).
@@ -217,10 +219,51 @@ curl -X POST http://localhost:8000/v1/ingest/file \
 
 ---
 
+### 1c. Ingest URL
+
+*   **Endpoint:** `POST /v1/ingest/url`
+*   **Description:** Submits a URL for the service to fetch and process the content. Supports similar document types as file upload, handled by `docling`.
+*   **Auth:** Bearer Token required.
+*   **Request Body:** `application/json`
+
+**Parameters:**
+*   `url` (string, required): The HTTP/HTTPS URL of the document to fetch and process.
+*   `callback_url` (string, optional): An HTTP/HTTPS URL to POST job status updates to.
+*   `callback_secret` (string, optional): A secret string used to sign the webhook payload (required if `callback_url` is provided, minimum 32 bytes).
+
+**Example Request:**
+
+```http
+POST /v1/ingest/url HTTP/1.1
+Host: localhost:8000
+Authorization: Bearer your_secret_token_here
+Content-Type: application/json
+X-Correlation-ID: dddddddd-eeee-ffff-gggg-hhhhhhhhhhhh
+
+{
+  "url": "https://gist.githubusercontent.com/realugbun/4a6c805b8617e66014c961f7134d933c/raw/e06c919b731b77868781abf674e814c07c17815f/sample_doc_for_chunksmith_test.txt",
+  "callback_url": "https://yourapp.com/webhook-handler",
+  "callback_secret": "your-secure-webhook-secret-minimum-32-bytes"
+}
+```
+
+**Example Response (202 Accepted):**
+
+```json
+{
+  "job_id": "456a7890-e12c-34d5-e678-901234567890",
+  "status": "queued",
+  "submitted_at": "2023-10-27T11:00:00.987654+00:00"
+}
+```
+
+---
+
 ### 2. Get Job Status
 
 *   **Endpoint:** `GET /v1/jobs/:job_id`
-*   **Description:** Retrieves the current status and details of a specific processing job. Poll this endpoint if not using webhooks.
+*   **Description:** Retrieves the current status and details of a specific processing 
+job. Poll this endpoint if not using webhooks.
 *   **Auth:** Bearer Token required.
 *   **Path Parameter:** `job_id` (UUID)
 

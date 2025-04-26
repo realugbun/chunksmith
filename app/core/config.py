@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     # Worker
     REDIS_QUEUE_TIMEOUT_SECONDS: int = 1800  # 30 minutes default
     WEBHOOK_TIMEOUT_SECONDS: int = 5  # Default timeout for webhook POST
+    MIN_CALLBACK_SECRET_BYTES: int = 32  # Minimum length for callback secrets
 
     # Limits
     MAX_FILE_SIZE_MB: int = 100

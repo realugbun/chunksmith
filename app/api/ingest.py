@@ -42,19 +42,21 @@ async def _enqueue_ingestion_task(
     """
     job_uuid: uuid.UUID
     job_id_str: str
-    callback_stored = False  # Flag to track if callback details were stored
+    callback_stored = False
+    log_extra_base = {"correlation_id": correlation_id}
 
     # 1. Create initial job record in DB
     try:
         job_uuid = await create_job()
         job_id_str = str(job_uuid)
-        log_extra = {"correlation_id": correlation_id, "job_id": job_id_str}
+        log_extra = {**log_extra_base, "job_id": job_id_str}
         logger.info("Created job record", extra=log_extra)
     except Exception:
-        logger.exception(
-            "Failed to create job record", extra={"correlation_id": correlation_id}
-        )
+        logger.exception("Failed to create job record", extra=log_extra_base)
         raise HTTPException(status_code=500, detail="Failed to initiate ingestion job.")
+
+    # Update log_extra now that job_id is available
+    log_extra = {**log_extra_base, "job_id": job_id_str}
 
     # 2. Store callback details in Redis if provided
     redis_conn: redis.Redis | None = None
@@ -131,6 +133,55 @@ def _validate_callback_url(url: str):
         return False
 
 
+# Shared Callback Validation Logic (for Form data)
+def _validate_callback_params(
+    callback_url: Optional[str] = None, callback_secret: Optional[str] = None
+) -> Tuple[Optional[str], Optional[str]]:
+    """Validates callback URL and secret, primarily for Form inputs."""
+    validated_url: Optional[str] = None
+    validated_secret: Optional[str] = None
+    log_extra = {"callback_url_provided": bool(callback_url)}
+
+    if callback_url:
+        # Secret must be present if URL is provided (essential for Form)
+        if not callback_secret:
+            logger.warning("Callback URL provided without secret.", extra=log_extra)
+            raise HTTPException(
+                status_code=422,
+                detail="callback_secret is required when callback_url is provided.",
+            )
+
+        # Validate URL format
+        if not _validate_callback_url(callback_url):
+            logger.warning("Invalid callback URL format provided.", extra=log_extra)
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid callback_url format or scheme. Must be HTTP/HTTPS.",
+            )
+
+        # Validate secret length
+        if len(callback_secret.encode("utf-8")) < MIN_CALLBACK_SECRET_BYTES:
+            logger.warning("Callback secret too short.", extra=log_extra)
+            raise HTTPException(
+                status_code=422,
+                detail=f"callback_secret must be at least {MIN_CALLBACK_SECRET_BYTES} bytes long.",
+            )
+
+        validated_url = callback_url
+        validated_secret = callback_secret
+        logger.debug("Callback URL and secret validated successfully.", extra=log_extra)
+    elif callback_secret:
+        # Secret provided without URL - might indicate user error
+        logger.warning(
+            "Callback secret provided without a callback URL.", extra=log_extra
+        )
+        raise HTTPException(
+            status_code=422, detail="callback_secret provided without callback_url."
+        )
+
+    return validated_url, validated_secret
+
+
 @router.post("/ingest/text", response_model=models.IngestResponse, status_code=202)
 async def ingest_text(
     payload: models.IngestTextPayload = Body(...),
@@ -157,29 +208,13 @@ async def ingest_text(
     log_extra = {"correlation_id": correlation_id, "source_filename": payload.filename}
     logger.info("Text ingest request received.", extra=log_extra)
 
-    callback_url: Optional[str] = None
-    callback_secret: Optional[str] = None
+    validated_callback_url: Optional[str] = (
+        str(payload.callback_url) if payload.callback_url else None
+    )
+    validated_callback_secret: Optional[str] = payload.callback_secret
 
-    if payload.callback_url:
-        # Check if callback_secret is provided
-        if not payload.callback_secret:
-            raise HTTPException(
-                status_code=422,
-                detail="callback_secret is required when callback_url is provided.",
-            )
-
-        # Validate secret length
-        if len(payload.callback_secret.encode("utf-8")) < MIN_CALLBACK_SECRET_BYTES:
-            raise HTTPException(
-                status_code=422,
-                detail=f"callback_secret must be at least {MIN_CALLBACK_SECRET_BYTES} bytes long.",
-            )
-
-        callback_url = str(payload.callback_url)
-        callback_secret = payload.callback_secret
-        logger.debug("Callback URL and secret provided and validated.", extra=log_extra)
-
-    logger.debug("Placeholder: Text payload size validation needed.")
+    if validated_callback_url:
+        logger.debug("Callback URL and secret provided via payload.", extra=log_extra)
 
     task_name = "workers.worker.process_document_text"
     worker_args = [correlation_id, payload.text, payload.filename]
@@ -190,8 +225,8 @@ async def ingest_text(
         task_name=task_name,
         worker_args_list=worker_args,
         log_msg=log_msg,
-        callback_url=callback_url,
-        callback_secret=callback_secret,
+        callback_url=validated_callback_url,
+        callback_secret=validated_callback_secret,
     )
 
 
@@ -204,13 +239,13 @@ async def ingest_file(
         None,
         description=(
             "Optional callback URL for webhook notification upon job completion/failure. "
-            "The webhook POST request body will conform to the JobStatusResponse schema."
+            "Must be HTTP/HTTPS. The webhook POST request body will conform to the JobStatusResponse schema."
         ),
         examples=["https://yourapp.com/webhook-handler"],
     ),
     callback_secret: Optional[str] = Form(
         None,
-        description="Secret for HMAC signature verification (required if callback_url is provided).",
+        description=f"Secret for HMAC signature verification (required if callback_url is provided, min {MIN_CALLBACK_SECRET_BYTES} bytes).",
         examples=["your-super-secret-string-here"],
     ),
     correlation_id: Optional[str] = Depends(get_correlation_id),
@@ -253,37 +288,28 @@ async def ingest_file(
 
     logger.info("File ingest request received.", extra=log_extra_base)
 
-    validated_callback_url: Optional[str] = None
-    validated_callback_secret: Optional[str] = None
-
-    if callback_url:
-        # Check if secret is provided
-        if not callback_secret:
-            raise HTTPException(
-                status_code=422,
-                detail="callback_secret is required when callback_url is provided.",
-            )
-
-        # Validate secret length
-        if len(callback_secret.encode("utf-8")) < MIN_CALLBACK_SECRET_BYTES:
-            raise HTTPException(
-                status_code=422,
-                detail=f"callback_secret must be at least {MIN_CALLBACK_SECRET_BYTES} bytes long.",
-            )
-
-        # Validate URL format
-        if not _validate_callback_url(callback_url):
-            raise HTTPException(
-                status_code=422, detail="Invalid callback_url format or scheme."
-            )
-
-        validated_callback_url = callback_url
-        validated_callback_secret = callback_secret
-        logger.debug(
-            "Callback URL and secret provided and validated.", extra=log_extra_base
+    # Use the shared validation function for Form parameters
+    try:
+        validated_callback_url, validated_callback_secret = _validate_callback_params(
+            callback_url, callback_secret
         )
-
-    logger.debug("Placeholder: File validation (size, type) needed.")
+        if validated_callback_url:
+            logger.debug(
+                "Callback URL and secret provided via form and validated.",
+                extra=log_extra_base,
+            )
+    except HTTPException as e:
+        # Re-raise validation errors from the helper
+        raise e
+    except Exception:
+        # Catch unexpected errors during validation
+        logger.exception(
+            "Unexpected error during callback parameter validation.",
+            extra=log_extra_base,
+        )
+        raise HTTPException(
+            status_code=500, detail="Error validating callback parameters."
+        )
 
     file_content: bytes
     try:
@@ -304,7 +330,56 @@ async def ingest_file(
 
     task_name = "workers.worker.process_document_file"
     worker_args = [correlation_id, file_content, filename, content_type]
-    log_msg = "Enqueuing job for file upload"
+    log_msg = f"Enqueuing job for file upload: {filename}"
+
+    return await _enqueue_ingestion_task(
+        correlation_id=correlation_id,
+        task_name=task_name,
+        worker_args_list=worker_args,
+        log_msg=log_msg,
+        callback_url=validated_callback_url,
+        callback_secret=validated_callback_secret,
+    )
+
+
+# Add New API Endpoint for URL
+@router.post("/ingest/url", response_model=models.IngestResponse, status_code=202)
+async def ingest_url(
+    payload: models.IngestUrlPayload = Body(...),
+    correlation_id: Optional[str] = Depends(get_correlation_id),
+):
+    """
+    **Step 1: Ingest Data from URL**
+
+    Ingests document content directly from a provided URL for asynchronous chunking and processing.
+
+    - Accepts `application/json` with a `url` field.
+    - Creates a background job and returns a `job_id` immediately.
+    - Optionally accepts `callback_url` and `callback_secret` in the JSON body to enable webhook notifications upon job completion or failure, conforming to the `JobStatusResponse` schema.
+
+    **Workflow:**
+    1. Call this endpoint with the URL (and optionally callback details).
+    2. Use the returned `job_id` to poll the `/v1/jobs/{job_id}` endpoint (Step 2) to check processing status (unless using webhooks).
+
+    **Webhook Parameters (Optional):**
+    - `callback_url`: An HTTP/HTTPS URL to POST job status updates to.
+    - `callback_secret`: A secret string used to sign the webhook payload (required if `callback_url` is provided).
+    """
+    log_extra = {"correlation_id": correlation_id, "source_url": str(payload.url)}
+    logger.info("URL ingest request received.", extra=log_extra)
+
+    # Pydantic model (CallbackMixin) handles validation (required secret, format)
+    validated_callback_url: Optional[str] = (
+        str(payload.callback_url) if payload.callback_url else None
+    )
+    validated_callback_secret: Optional[str] = payload.callback_secret
+
+    if validated_callback_url:
+        logger.debug("Callback URL and secret provided via payload.", extra=log_extra)
+
+    task_name = "workers.worker.process_document_url"
+    worker_args = [correlation_id, str(payload.url)]
+    log_msg = f"Enqueuing job for URL: {payload.url}"
 
     return await _enqueue_ingestion_task(
         correlation_id=correlation_id,

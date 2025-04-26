@@ -19,6 +19,30 @@ CHUNKS_CREATED_COUNTER = Counter(
 JOBS_FAILED_COUNTER = Counter(
     "document_service_jobs_failed_total",
     "Total number of ingestion jobs that failed",
+    ["worker", "reason"],
+    registry=REGISTRY,
+)
+
+PROCESSING_TIME_BUCKETS = (
+    0.1,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
+    float("inf"),
+)
+
+JOB_PROCESSING_DURATION_SECONDS = Histogram(
+    "chunksmith_job_processing_duration_seconds",
+    "Histogram of job processing durations in seconds",
+    ["worker", "status"],  # Labels for worker function name and final status
+    buckets=PROCESSING_TIME_BUCKETS,
     registry=REGISTRY,
 )
 
