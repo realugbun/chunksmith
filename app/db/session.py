@@ -27,11 +27,20 @@ class DatabaseConnectionManager:
                 return
 
             try:
+                # Enhance connection string with keepalives
+                # Ensure the base URL doesn't already have query params; append appropriately
+                conninfo_base = settings.POSTGRES_URL
+                separator = "&" if "?" in conninfo_base else "?"
+                conninfo_enhanced = f"{conninfo_base}{separator}keepalives_idle=60&keepalives_interval=10&keepalives_count=5"
+
                 self._pool = AsyncConnectionPool(
-                    conninfo=settings.POSTGRES_URL,
-                    min_size=5,
-                    max_size=20,
-                    open=True,
+                    conninfo=conninfo_enhanced,
+                    min_size=5,  
+                    max_size=20, 
+                    open=True,   
+                    max_idle=300,  
+                    max_lifetime=3600, 
+                    timeout=30.0, 
                 )
                 async with self._pool.connection() as conn:
                     await conn.execute("SELECT 1")

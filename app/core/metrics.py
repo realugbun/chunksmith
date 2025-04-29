@@ -7,12 +7,14 @@ REGISTRY = CollectorRegistry(auto_describe=True)
 DOCS_PROCESSED_COUNTER = Counter(
     "document_service_docs_processed_total",
     "Total number of documents successfully processed",
+    ["worker"],
     registry=REGISTRY,
 )
 
 CHUNKS_CREATED_COUNTER = Counter(
     "document_service_chunks_created_total",
     "Total number of chunks created from documents",
+    ["worker"],
     registry=REGISTRY,
 )
 
