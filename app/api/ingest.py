@@ -5,6 +5,7 @@ import json
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Body, Form
+from psycopg_pool import AsyncConnectionPool
 import redis as sync_redis
 from rq import Queue
 from rq.job import Callback
@@ -14,7 +15,7 @@ from api import models
 from core.config import settings
 from core.redis_client import get_redis_connection, redis
 from db.jobs import create_job
-from api.deps import get_correlation_id
+from api.deps import get_correlation_id, get_db_pool
 from workers.hooks import run_dispatch_webhook_sync
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ async def _enqueue_ingestion_task(
     task_name: str,
     worker_args_list: List[Any],
     log_msg: str,
+    pool: AsyncConnectionPool,
     callback_url: Optional[str] = None,
     callback_secret: Optional[str] = None,
 ) -> models.IngestResponse:
@@ -47,7 +49,7 @@ async def _enqueue_ingestion_task(
 
     # 1. Create initial job record in DB
     try:
-        job_uuid = await create_job()
+        job_uuid = await create_job(pool=pool)
         job_id_str = str(job_uuid)
         log_extra = {**log_extra_base, "job_id": job_id_str}
         logger.info("Created job record", extra=log_extra)
@@ -186,6 +188,7 @@ def _validate_callback_params(
 async def ingest_text(
     payload: models.IngestTextPayload = Body(...),
     correlation_id: Optional[str] = Depends(get_correlation_id),
+    pool: AsyncConnectionPool = Depends(get_db_pool)
 ):
     """
     **Step 1: Ingest Text Data**
@@ -225,6 +228,7 @@ async def ingest_text(
         task_name=task_name,
         worker_args_list=worker_args,
         log_msg=log_msg,
+        pool=pool,
         callback_url=validated_callback_url,
         callback_secret=validated_callback_secret,
     )
@@ -249,6 +253,7 @@ async def ingest_file(
         examples=["your-super-secret-string-here"],
     ),
     correlation_id: Optional[str] = Depends(get_correlation_id),
+    pool: AsyncConnectionPool = Depends(get_db_pool)
 ):
     """
     **Step 1: Ingest File Data**
@@ -337,6 +342,7 @@ async def ingest_file(
         task_name=task_name,
         worker_args_list=worker_args,
         log_msg=log_msg,
+        pool=pool,
         callback_url=validated_callback_url,
         callback_secret=validated_callback_secret,
     )
@@ -347,6 +353,7 @@ async def ingest_file(
 async def ingest_url(
     payload: models.IngestUrlPayload = Body(...),
     correlation_id: Optional[str] = Depends(get_correlation_id),
+    pool: AsyncConnectionPool = Depends(get_db_pool)
 ):
     """
     **Step 1: Ingest Data from URL**
@@ -386,6 +393,7 @@ async def ingest_url(
         task_name=task_name,
         worker_args_list=worker_args,
         log_msg=log_msg,
+        pool=pool,
         callback_url=validated_callback_url,
         callback_secret=validated_callback_secret,
     )

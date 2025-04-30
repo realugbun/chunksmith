@@ -1,10 +1,11 @@
 import logging
 import uuid
 from fastapi import APIRouter, Depends, HTTPException
+from psycopg_pool import AsyncConnectionPool
 
 from api import models
 from db.jobs import get_job_by_id, soft_delete_job
-from api.deps import get_correlation_id
+from api.deps import get_correlation_id, get_db_pool
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -12,7 +13,9 @@ router = APIRouter()
 
 @router.get("/jobs/{job_id}", response_model=models.JobStatusResponse)
 async def get_job_status(
-    job_id: uuid.UUID, correlation_id: str | None = Depends(get_correlation_id)
+    job_id: uuid.UUID,
+    correlation_id: str | None = Depends(get_correlation_id),
+    pool: AsyncConnectionPool = Depends(get_db_pool)
 ):
     """
     **Step 2: Check Job Status**
@@ -32,7 +35,7 @@ async def get_job_status(
         "Request for job status.",
         extra={"correlation_id": correlation_id, "job_id": job_id},
     )
-    job = await get_job_by_id(job_id)
+    job = await get_job_by_id(job_id, pool=pool)
     if not job:
         logger.warning(
             "Job not found.", extra={"correlation_id": correlation_id, "job_id": job_id}
@@ -45,13 +48,15 @@ async def get_job_status(
 
 @router.delete("/jobs/{job_id}", status_code=200)
 async def delete_job(
-    job_id: uuid.UUID, correlation_id: str | None = Depends(get_correlation_id)
+    job_id: uuid.UUID,
+    correlation_id: str | None = Depends(get_correlation_id),
+    pool: AsyncConnectionPool = Depends(get_db_pool)
 ):
     logger.info(
         "Request to delete job.",
         extra={"correlation_id": correlation_id, "job_id": job_id},
     )
-    deleted = await soft_delete_job(job_id)
+    deleted = await soft_delete_job(job_id, pool=pool)
     if not deleted:
         logger.warning(
             "Job not found for deletion.",

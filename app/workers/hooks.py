@@ -13,7 +13,9 @@ from rq.job import Job
 from redis import Redis as SyncRedis
 
 from core.config import settings
+from core.config import Settings # Import Settings for pool config
 from core.redis_client import get_redis_connection
+from psycopg_pool import AsyncConnectionPool # Import pool class
 from db.jobs import get_job_by_id
 from api.models import JobStatusResponse
 from core.logging import correlation_id_cv
@@ -91,7 +93,23 @@ async def dispatch_webhook(
             return
 
         # 2. Fetch final job status from DB
-        job_details_dict = await get_job_by_id(uuid.UUID(job_id_str))
+        job_details_dict = None
+        # <<< FIX A: Create dedicated pool for webhook DB access >>>
+        try:
+            conninfo_base = settings.POSTGRES_URL
+            separator = "&" if "?" in conninfo_base else "?"
+            conninfo_enhanced = f"{conninfo_base}{separator}keepalives_idle=60&keepalives_interval=10&keepalives_count=5"
+            async with AsyncConnectionPool(
+                conninfo=conninfo_enhanced,
+                min_size=1, max_size=2, timeout=10.0, name=f"webhook-pool-{job_id_str[:8]}"
+            ) as webhook_pool:
+                 job_details_dict = await get_job_by_id(uuid.UUID(job_id_str), pool=webhook_pool)
+
+        except Exception as db_err:
+            logger.exception("Webhook hook failed to query DB for job details", exc_info=db_err, extra=log_extra)
+            # Can't proceed without job details
+            return
+        # <<< END FIX >>>
 
         if not job_details_dict:
             logger.error(

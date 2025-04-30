@@ -4,8 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from psycopg.rows import dict_row
-
-from db.session import db_manager
+from psycopg_pool import AsyncConnectionPool
 
 logger = logging.getLogger(__name__)
 
@@ -13,14 +12,13 @@ logger = logging.getLogger(__name__)
 JobStatus = str  # Could use Literal['queued', 'processing', 'completed', 'failed', 'completed_with_errors']
 
 
-async def create_job() -> uuid.UUID:
+async def create_job(pool: AsyncConnectionPool) -> uuid.UUID:
     """Creates a new job record with status 'queued' and returns its UUID."""
     sql = """
         INSERT INTO jobs (status)
         VALUES ('queued')
         RETURNING job_id;
     """
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(sql)
@@ -34,10 +32,9 @@ async def create_job() -> uuid.UUID:
                 raise RuntimeError("Failed to create job")
 
 
-async def get_job_by_id(job_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+async def get_job_by_id(job_id: uuid.UUID, pool: AsyncConnectionPool) -> Optional[Dict[str, Any]]:
     """Retrieves a job record by its UUID."""
     sql = "SELECT * FROM jobs WHERE job_id = %s AND deleted_at IS NULL;"
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(sql, (job_id,))
@@ -46,6 +43,7 @@ async def get_job_by_id(job_id: uuid.UUID) -> Optional[Dict[str, Any]]:
 
 
 async def update_job_status(
+    pool: AsyncConnectionPool,
     job_id: uuid.UUID,
     status: str,
     started_at: Optional[datetime] = None,
@@ -93,7 +91,6 @@ async def update_job_status(
     """
     values = list(updates.values()) + [job_id]
 
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(sql, tuple(values), prepare=False)
@@ -110,14 +107,13 @@ async def update_job_status(
                 return False
 
 
-async def soft_delete_job(job_id: uuid.UUID) -> bool:
+async def soft_delete_job(job_id: uuid.UUID, pool: AsyncConnectionPool) -> bool:
     """Marks a job as deleted by setting the deleted_at timestamp."""
     sql = """
         UPDATE jobs
         SET deleted_at = CURRENT_TIMESTAMP
         WHERE job_id = %s AND deleted_at IS NULL;
     """
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(sql, (job_id,))

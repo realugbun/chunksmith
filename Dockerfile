@@ -43,7 +43,7 @@ WORKDIR /app
 
 # Download core set of docling models during the build
 # Rebuild the image if the models are updated
-RUN uv add huggingface_hub && uv run huggingface-cli download ds4sd/docling-models
+# RUN uv add huggingface_hub && uv run huggingface-cli download ds4sd/docling-models
 
 # Default command to run the worker
 CMD ["uv", "run", "python", "-m", "workers.worker"] 

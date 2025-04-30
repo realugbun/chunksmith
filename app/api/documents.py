@@ -2,6 +2,7 @@ import logging
 import uuid
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Query
+from psycopg_pool import AsyncConnectionPool
 
 from api import models
 from core.config import settings
@@ -13,7 +14,7 @@ from db.chunks import (
     get_chunks_by_doc_id,
     count_chunks_by_doc_id,
 )
-from api.deps import get_correlation_id
+from api.deps import get_correlation_id, get_db_pool
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -21,7 +22,9 @@ router = APIRouter()
 
 @router.get("/documents/{doc_id}/fulltext", response_model=models.FullTextResponse)
 async def get_document_full_text(
-    doc_id: uuid.UUID, correlation_id: str | None = Depends(get_correlation_id)
+    doc_id: uuid.UUID,
+    correlation_id: str | None = Depends(get_correlation_id),
+    pool: AsyncConnectionPool = Depends(get_db_pool)
 ):
     """
     **Step 3a: Retrieve Full Text**
@@ -37,7 +40,7 @@ async def get_document_full_text(
         extra={"correlation_id": correlation_id, "doc_id": doc_id},
     )
 
-    doc_data = await get_document_text_and_created_at(doc_id)
+    doc_data = await get_document_text_and_created_at(doc_id, pool=pool)
 
     if not doc_data:
         logger.warning(
@@ -82,6 +85,7 @@ async def get_document_chunks(
     ),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
     correlation_id: str | None = Depends(get_correlation_id),
+    pool: AsyncConnectionPool = Depends(get_db_pool)
 ):
     """
     **Step 3b: Retrieve Document Chunks**
@@ -104,12 +108,13 @@ async def get_document_chunks(
 
     # Fetch chunks and total count concurrently
     chunks_data, total_count = await asyncio.gather(
-        get_chunks_by_doc_id(doc_id, limit, offset), count_chunks_by_doc_id(doc_id)
+        get_chunks_by_doc_id(doc_id, pool=pool, limit=limit, offset=offset),
+        count_chunks_by_doc_id(doc_id, pool=pool)
     )
 
     # Check if document exists if count is 0
     if total_count == 0:
-        doc = await get_document_by_id(doc_id)
+        doc = await get_document_by_id(doc_id, pool=pool)
         if not doc:
             logger.warning(
                 "Document not found.",

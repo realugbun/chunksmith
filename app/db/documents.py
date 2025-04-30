@@ -2,14 +2,14 @@ import logging
 import uuid
 from typing import Any, Dict, Optional
 
+from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import dict_row
-
-from db.session import db_manager
 
 logger = logging.getLogger(__name__)
 
 
 async def create_document(
+    pool: AsyncConnectionPool,
     job_id: uuid.UUID,
     filename: Optional[str],
     content_type: Optional[str],
@@ -35,7 +35,6 @@ async def create_document(
         source_url,
         fetched_at,
     )
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(insert_sql, values, prepare=False)
@@ -53,10 +52,9 @@ async def create_document(
                 raise RuntimeError("Failed to create document")
 
 
-async def get_document_by_id(doc_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+async def get_document_by_id(doc_id: uuid.UUID, pool: AsyncConnectionPool) -> Optional[Dict[str, Any]]:
     """Retrieves a document record by its UUID."""
     sql = "SELECT * FROM documents WHERE doc_id = %s AND deleted_at IS NULL;"
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(sql, (doc_id,))
@@ -65,11 +63,10 @@ async def get_document_by_id(doc_id: uuid.UUID) -> Optional[Dict[str, Any]]:
 
 
 async def get_document_text_and_created_at(
-    doc_id: uuid.UUID,
+    doc_id: uuid.UUID, pool: AsyncConnectionPool
 ) -> Optional[Dict[str, Any]]:
     """Retrieves the full_text and created_at fields for a given document ID."""
     sql = "SELECT full_text, created_at FROM documents WHERE doc_id = %s AND deleted_at IS NULL;"
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(sql, (doc_id,))
@@ -77,7 +74,7 @@ async def get_document_text_and_created_at(
             return result
 
 
-async def soft_delete_document(doc_id: uuid.UUID) -> bool:
+async def soft_delete_document(doc_id: uuid.UUID, pool: AsyncConnectionPool) -> bool:
     """Marks a document and its associated chunks as deleted."""
     # Note: Chunks are deleted via CASCADE constraint defined in migration
     sql = """
@@ -85,7 +82,6 @@ async def soft_delete_document(doc_id: uuid.UUID) -> bool:
         SET deleted_at = CURRENT_TIMESTAMP
         WHERE doc_id = %s AND deleted_at IS NULL;
     """
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(sql, (doc_id,))

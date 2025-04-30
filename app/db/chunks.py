@@ -3,6 +3,7 @@ import uuid
 import json
 from typing import Any, Dict, List, Optional
 
+from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import dict_row
 
 from db.session import db_manager
@@ -11,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 async def create_chunk(
+    pool: AsyncConnectionPool,
     doc_id: uuid.UUID,
     page: Optional[int],
     offset: Optional[int],
@@ -26,7 +28,6 @@ async def create_chunk(
         RETURNING chunk_id;
     """
     values = (doc_id, page, offset, byte_length, text, sequence, metadata)
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(sql, values)
@@ -40,7 +41,7 @@ async def create_chunk(
                 raise RuntimeError("Failed to create chunk")
 
 
-async def create_chunks_batch(chunks_data: List[Dict[str, Any]]) -> int:
+async def create_chunks_batch(chunks_data: List[Dict[str, Any]], pool: AsyncConnectionPool) -> int:
     """Creates multiple chunks by executing individual INSERTs in a loop.
     Returns number of chunks inserted.
     """
@@ -52,7 +53,6 @@ async def create_chunks_batch(chunks_data: List[Dict[str, Any]]) -> int:
         VALUES (%s, %s, %s, %s, %s, %s, %s);
     """
     inserted_count = 0
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.transaction():
             async with conn.cursor() as cur:
@@ -89,7 +89,7 @@ async def create_chunks_batch(chunks_data: List[Dict[str, Any]]) -> int:
 
 
 async def get_chunks_by_doc_id(
-    doc_id: uuid.UUID, limit: int = 50, offset: int = 0
+    doc_id: uuid.UUID, pool: AsyncConnectionPool, limit: int = 50, offset: int = 0
 ) -> List[Dict[str, Any]]:
     """Retrieves a paginated list of chunks for a given document ID, ordered by sequence."""
     sql = """
@@ -99,7 +99,6 @@ async def get_chunks_by_doc_id(
         ORDER BY sequence, page, "offset"
         LIMIT %s OFFSET %s;
     """
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(sql, (doc_id, limit, offset))
@@ -107,10 +106,9 @@ async def get_chunks_by_doc_id(
             return results
 
 
-async def count_chunks_by_doc_id(doc_id: uuid.UUID) -> int:
+async def count_chunks_by_doc_id(doc_id: uuid.UUID, pool: AsyncConnectionPool) -> int:
     """Counts the total number of non-deleted chunks for a given document ID."""
     sql = "SELECT COUNT(*) FROM chunks WHERE doc_id = %s AND deleted_at IS NULL;"
-    pool = db_manager.pool
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(sql, (doc_id,))
